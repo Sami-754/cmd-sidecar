@@ -81,6 +81,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "cmd-sidecar"}
+
 # Concurrency lock: maximum 1 execution at a time with nice -n 19 to guarantee ZERO PC lag
 SEMAPHORE = asyncio.Semaphore(1)
 
