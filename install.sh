@@ -20,10 +20,10 @@ fi
 # A distro node can be ABI-shifted by a library upgrade (e.g. libsimdjson.so.NN missing)
 # and then every `#!/usr/bin/env node` CLI dies with exit 127. Probe before trusting PATH.
 NODE_BIN=""
-for candidate in "$(command -v node 2>/dev/null || true)" \
+for candidate in "/usr/local/bin/node" "/usr/bin/node" \
+                 "$(command -v node 2>/dev/null || true)" \
                  "$HOME/.local/share/fnm/aliases/default/bin/node" \
-                 "$HOME/.nvm/versions/node/"*/bin/node \
-                 "/usr/local/bin/node" "/usr/bin/node"; do
+                 "$HOME/.nvm/versions/node/"*/bin/node; do
     [ -n "$candidate" ] && [ -x "$candidate" ] || continue
     if "$candidate" -e 'process.exit(0)' >/dev/null 2>&1; then
         # Canonicalise: a version manager may hand us a volatile shell-scoped symlink
