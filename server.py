@@ -33,12 +33,14 @@ def discover_cmd_models() -> List[Dict[str, str]]:
             line = line.strip()
             if not line or line.startswith("Available models") or line.startswith("Pass the") or line.startswith("cmd --") or line.startswith("Docs:") or line.startswith("Decision"):
                 continue
-            if line in ("Open Source", "Stealth", "Anthropic", "OpenAI", "Google", "Sakana", "Meta", "xAI"):
-                continue
             parts = re.split(r"\s{2,}", line, maxsplit=1)
             model_id = parts[0].strip()
             desc = parts[1].strip() if len(parts) > 1 else ""
-            if ("/" in model_id or "-" in model_id) and model_id not in seen:
+            # Guard: an over-long id collapses the column padding, so the whole line lands in
+            # parts[0]. Reject anything with whitespace instead of emitting a garbage model id.
+            if re.search(r"\s", model_id):
+                continue
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", model_id) and model_id not in seen:
                 seen.add(model_id)
                 models.append({"id": model_id, "description": desc})
         if models:
@@ -66,6 +68,19 @@ MODEL_MAP = {
 }
 
 API_KEY_EXPECTED = os.environ.get("CMD_API_KEY", "sk-cmd-local")
+
+# --- Pi catalog auto-sync -------------------------------------------------
+# The live `cmd --list-models` catalog is projected into pi's models.json at boot and on
+# every periodic refresh, so a fresh install self-configures and CLI updates self-heal.
+PI_MODELS_JSON = os.environ.get("PI_MODELS_JSON", os.path.expanduser("~/.pi/agent/models.json"))
+PI_PROVIDER_KEY = os.environ.get("PI_PROVIDER_KEY", "cmd")
+PI_PROVIDER_NAME = os.environ.get("PI_PROVIDER_NAME", "Command Code cmd sidecar (localhost:8001)")
+PI_MODELS_SYNC = os.environ.get("PI_MODELS_SYNC", "1").lower() not in ("0", "false", "no", "off")
+PI_MODELS_SYNC_INTERVAL = int(os.environ.get("PI_MODELS_SYNC_INTERVAL", "300"))
+# Comma-separated deny list kept across regenerations so cost-banned families never come back.
+PI_MODELS_DENY = os.environ.get("PI_MODELS_DENY", "kimi,moonshot,qwen")
+PI_MODELS_MAX_TOKENS = int(os.environ.get("PI_MODELS_MAX_TOKENS", "8192"))
+PI_MODELS_CONTEXT = int(os.environ.get("PI_MODELS_CONTEXT", "131072"))
 
 app = FastAPI(
     title="Official Command Code OpenAI Bridge",
@@ -162,7 +177,141 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
 
+# --- Pi catalog projection ---
+
+def is_denied_model(model_id: str) -> bool:
+    """True when a requested model matches PI_MODELS_DENY (enforced, not just hidden from the catalog)."""
+    deny = [p.strip().lower() for p in PI_MODELS_DENY.split(",") if p.strip()]
+    return any(pattern in (model_id or "").lower() for pattern in deny)
+
+
+def _pi_model_entries(models: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Projects a cmd catalog into pi models.json entries, honouring the cost deny list."""
+    deny = [p.strip().lower() for p in PI_MODELS_DENY.split(",") if p.strip()]
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    for model in models:
+        model_id = str(model.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        if any(pattern in model_id.lower() for pattern in deny):
+            continue
+        seen.add(model_id)
+        entries.append(
+            {
+                "id": model_id,
+                "name": str(model.get("description") or model_id).strip(),
+                "contextWindow": PI_MODELS_CONTEXT,
+                "maxTokens": PI_MODELS_MAX_TOKENS,
+                "input": ["text"],
+            }
+        )
+    return entries
+
+
+def _default_pi_provider() -> Dict[str, Any]:
+    return {
+        "name": PI_PROVIDER_NAME,
+        "baseUrl": os.environ.get("PI_BASE_URL", "http://localhost:8001/v1"),
+        "api": "openai-completions",
+        "apiKey": os.environ.get("PI_API_KEY", API_KEY_EXPECTED),
+        "compat": {"supportsUsageInStreaming": False},
+    }
+
+
+def sync_pi_models(models: List[Dict[str, str]]) -> bool:
+    """Writes the catalog into pi's models.json provider block. Returns True when the file changed."""
+    if not PI_MODELS_SYNC:
+        return False
+
+    entries = _pi_model_entries(models)
+    if not entries:
+        return False
+
+    try:
+        data: Dict[str, Any] = {}
+        if os.path.exists(PI_MODELS_JSON):
+            with open(PI_MODELS_JSON, "r", encoding="utf-8") as fh:
+                data = json.load(fh) or {}
+        elif not os.path.isdir(os.path.dirname(PI_MODELS_JSON) or "."):
+            return False
+
+        providers = data.setdefault("providers", {})
+        provider = providers.setdefault(PI_PROVIDER_KEY, _default_pi_provider())
+        if provider.get("models") == entries:
+            return False
+
+        provider["models"] = entries
+        try:
+            shutil.copyfile(PI_MODELS_JSON, PI_MODELS_JSON + ".bak")
+        except OSError:
+            pass
+        tmp_path = f"{PI_MODELS_JSON}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, PI_MODELS_JSON)
+        return True
+    except Exception:
+        return False
+
+
+def refresh_models(write_catalog: bool = True) -> List[Dict[str, str]]:
+    """Re-discovers the live CLI catalog and optionally re-projects it into pi's models.json."""
+    global ALL_MODELS
+    discovered = discover_cmd_models()
+    if discovered:
+        ALL_MODELS = discovered
+    if write_catalog:
+        sync_pi_models(ALL_MODELS)
+    return ALL_MODELS
+
+
+async def _catalog_refresh_loop() -> None:
+    """Keeps the catalog fresh across CLI updates (and self-heals pi config after upgrades)."""
+    if not PI_MODELS_SYNC or PI_MODELS_SYNC_INTERVAL <= 0:
+        return
+    while True:
+        try:
+            await asyncio.sleep(PI_MODELS_SYNC_INTERVAL)
+            await asyncio.to_thread(refresh_models, True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+
+
+@app.on_event("startup")
+async def _startup_sync() -> None:
+    """Boot-time projection so a fresh install configures pi with no manual step."""
+    app.state.catalog_task = asyncio.create_task(_catalog_refresh_loop())
+    try:
+        await asyncio.to_thread(refresh_models, True)
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _shutdown_sync() -> None:
+    task = getattr(app.state, "catalog_task", None)
+    if task and not task.done():
+        task.cancel()
+
+
 # --- Endpoints ---
+
+@app.post("/v1/models/sync")
+@app.post("/models/sync")
+async def sync_models_endpoint(_: bool = Depends(verify_api_key)):
+    """Re-discovers the CLI catalog and re-projects it into pi's models.json."""
+    models = await asyncio.to_thread(refresh_models, True)
+    return {
+        "status": "ok",
+        "models": len(models),
+        "pi_models_json": PI_MODELS_JSON,
+        "provider": PI_PROVIDER_KEY,
+    }
+
 
 @app.get("/health")
 async def health():
@@ -177,7 +326,7 @@ async def health():
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models(_: bool = Depends(verify_api_key)):
-    """OpenAI-compatible models catalog."""
+    """OpenAI-compatible models catalog (cost-banned families excluded via PI_MODELS_DENY)."""
     return {
         "object": "list",
         "data": [
@@ -191,6 +340,7 @@ async def list_models(_: bool = Depends(verify_api_key)):
                 "parent": None
             }
             for m in ALL_MODELS
+            if not is_denied_model(m["id"])
         ]
     }
 
