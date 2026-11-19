@@ -116,9 +116,44 @@ def verify_api_key(authorization: Optional[str] = Header(None)):
 
 # --- Request / Response Models ---
 
+def _extract_text(content: Any) -> str:
+    """Flattens OpenAI string content or content-part arrays (e.g. [{"type":"text","text":"yo"}]) to plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                if "text" in part:
+                    parts.append(str(part["text"]))
+                elif isinstance(part.get("content"), str):
+                    parts.append(part["content"])
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(p for p in parts if p)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _format_message(role: str, content: Any, tool_calls: Optional[List[Any]] = None) -> str:
+    role_label = "System" if role == "system" else ("User" if role == "user" else "Assistant")
+    text = _extract_text(content)
+    if tool_calls:
+        rendered = []
+        for call in tool_calls:
+            if isinstance(call, dict):
+                fn = call.get("function") or {}
+                rendered.append(f'{fn.get("name", "tool")}({fn.get("arguments", "")})')
+        if rendered:
+            text = (text + "\n" if text else "") + "[called: " + ", ".join(rendered) + "]"
+    return f"{role_label}:\n{text}"
+
+
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any = None
+    tool_calls: Optional[List[Any]] = None
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = "deepseek/deepseek-v4.1-flash"
@@ -163,11 +198,7 @@ async def list_models(_: bool = Depends(verify_api_key)):
 @app.post("/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, _: bool = Depends(verify_api_key)):
     """OpenAI-compatible Chat Completions endpoint."""
-    conversation = []
-    for msg in req.messages:
-        role_label = "System" if msg.role == "system" else ("User" if msg.role == "user" else "Assistant")
-        conversation.append(f"{role_label}:\n{msg.content}")
-    
+    conversation = [_format_message(msg.role, msg.content, msg.tool_calls) for msg in req.messages]
     full_prompt = "\n\n".join(conversation)
     chosen_model = req.model or "deepseek/deepseek-v4.1-flash"
     target_model = MODEL_MAP.get(chosen_model, chosen_model)
